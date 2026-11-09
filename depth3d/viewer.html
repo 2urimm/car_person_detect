@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Depth 3D Viewer</title>
+<style>
+  :root { --bg:#111317; --panel:#1b1e24; --line:#2c313a; --text:#e6e8eb; --muted:#9aa3ad; --accent:#4da3ff; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font:13px/1.4 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; overflow:hidden; }
+  #view { position:fixed; inset:0; }
+  #bar { position:fixed; left:0; right:0; top:0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;
+    padding:8px 12px; background:rgba(27,30,36,.92); border-bottom:1px solid var(--line); z-index:2; }
+  #bar .grp { display:flex; gap:6px; align-items:center; }
+  button, select { background:#262a32; color:var(--text); border:1px solid var(--line); border-radius:6px;
+    padding:4px 10px; font:inherit; cursor:pointer; }
+  button.on { background:var(--accent); border-color:var(--accent); color:#06121f; }
+  #seek { flex:1 1 260px; min-width:160px; }
+  label { color:var(--muted); display:flex; gap:4px; align-items:center; }
+  #hud { position:fixed; left:12px; bottom:12px; padding:8px 12px; background:rgba(27,30,36,.85);
+    border:1px solid var(--line); border-radius:8px; z-index:2; font-variant-numeric:tabular-nums; }
+  #hud b { font-size:15px; }
+  #msg { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); padding:14px 18px; max-width:560px;
+    background:var(--panel); border:1px solid var(--line); border-radius:8px; z-index:3; display:none; white-space:pre-wrap; }
+  #legend { position:fixed; right:12px; bottom:12px; z-index:2; display:flex; gap:6px; align-items:stretch;
+    padding:8px; background:rgba(27,30,36,.85); border:1px solid var(--line); border-radius:8px; }
+  #legend canvas { width:12px; height:120px; border-radius:2px; }
+  #legend div { display:flex; flex-direction:column; justify-content:space-between; color:var(--muted); }
+  .mapOnly, .playOnly { display:contents; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="view"></div>
+<div id="bar">
+  <div class="grp">
+    <button id="mPlay" class="on">재생</button><button id="mMap">누적 지도</button>
+  </div>
+  <div class="grp playOnly">
+    <button id="play">▶</button>
+    <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option>
+      <option value="2">2x</option><option value="4">4x</option><option value="8">8x</option></select>
+  </div>
+  <input id="seek" type="range" min="0" max="0" value="0">
+  <div class="grp">
+    <label>점 간격 <select id="stride"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></label>
+    <label>최대 거리 <select id="zmax"><option>5</option><option>8</option><option selected>12</option><option>20</option></select> m</label>
+    <label title="누적 지도의 카메라 위치로 프레임을 배치"><input id="world" type="checkbox"> 월드 좌표</label>
+    <label title="재생 중 누적 지도를 함께 표시"><input id="overlay" type="checkbox"> 지도 겹치기</label>
+    <label><input id="follow" type="checkbox" checked> 카메라 따라가기</label>
+  </div>
+</div>
+<div id="hud">불러오는 중…</div>
+<div id="legend"><canvas id="lg" width="12" height="120"></canvas><div><span>3 m</span><span>0 m</span></div></div>
+<div id="msg"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+
+// ---- 데이터 위치 (code/ 폴더를 서버 루트로 띄운다고 가정, URL ?log=…&map=… 로 변경 가능)
+const qs = new URLSearchParams(location.search);
+const LOG = (qs.get("log") || "../logs/depth_20261016_195111").replace(/\/$/, "");
+const MAP = (qs.get("map") || "../logs/depth3d_out/full").replace(/\/$/, "");
+const H_MAX = 3.0;
+
+const $ = (id) => document.getElementById(id);
+const showMsg = (t) => { $("msg").textContent = t; $("msg").style.display = t ? "block" : "none"; };
+
+// ---- three.js 기본 구성. RealSense(x 오른쪽, y 아래, z 앞) -> three(x, -y, -z) : x축 180도 회전
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;   // 점 색(sRGB 값)을 변환 없이 그대로 표시
+$("view").appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111317);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+const rs = new THREE.Group();               // RealSense 좌표계를 담는 그룹
+rs.rotation.x = Math.PI;
+scene.add(rs);
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize); resize();
+
+// turbo 근사 컬러맵
+function turbo(t) {
+  t = Math.min(1, Math.max(0, t));
+  const r = 0.1357 + t * (4.5974 - t * (42.3277 - t * (130.5887 - t * (150.5666 - t * 58.1375))));
+  const g = 0.0914 + t * (2.1856 + t * (4.8052 - t * (14.0195 - t * (4.2109 + t * 2.7747))));
+  const b = 0.1067 + t * (12.5925 - t * (60.1097 - t * (109.0745 - t * (88.5066 - t * 26.8183))));
+  return [Math.min(1, Math.max(0, r)), Math.min(1, Math.max(0, g)), Math.min(1, Math.max(0, b))];
+}
+{ const c = $("lg").getContext("2d");
+  for (let y = 0; y < 120; y++) { const [r, g, b] = turbo(1 - y / 119); c.fillStyle = `rgb(${r * 255},${g * 255},${b * 255})`; c.fillRect(0, y, 12, 1); } }
+
+// ---- 로드 유틸
+async function getText(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${r.status} ${url}`); return r.text(); }
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/); const head = lines[0].split(",");
+  return lines.slice(1).map((l) => { const v = l.split(","); const o = {}; head.forEach((h, i) => (o[h] = v[i])); return o; });
+}
+function parseNpy(buf) {
+  const u8 = new Uint8Array(buf);
+  const major = u8[6];
+  const dv = new DataView(buf);
+  const hlen = major === 1 ? dv.getUint16(8, true) : dv.getUint32(8, true);
+  const off = (major === 1 ? 10 : 12) + hlen;
+  const header = new TextDecoder().decode(u8.slice(major === 1 ? 10 : 12, off));
+  if (!header.includes("<u2")) throw new Error("uint16 아님: " + header);
+  const shape = header.match(/shape':\s*\((\d+),\s*(\d+)/);
+  return { data: new Uint16Array(buf, off), h: +shape[1], w: +shape[2] };
+}
+
+// ---- 상태
+let meta, index, level = null, poses = null, poseFrames = null, mapPoints = null, trajLine = null;
+let cur = 0, playing = false, mode = "play", lastT = 0, accum = 0;
+const cache = new Map();                    // frame -> Promise<parsed npy>
+
+function fetchFrame(i) {
+  if (!cache.has(i)) {
+    cache.set(i, fetch(`${LOG}/${index[i].file}`).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }).then(parseNpy));
+    if (cache.size > 120) cache.delete(cache.keys().next().value);
+  }
+  return cache.get(i);
+}
+
+// 프레임 점구름 (BufferGeometry 재사용)
+const frameGeom = new THREE.BufferGeometry();
+const frameMat = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
+const framePts = new THREE.Points(frameGeom, frameMat);
+framePts.frustumCulled = false;
+rs.add(framePts);
+const camMarker = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.35, 4), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+camMarker.geometry.rotateX(Math.PI / 2);    // 원뿔이 +Z(앞)를 향하게
+rs.add(camMarker);
+
+function poseFor(i) {                        // 처리된 프레임 중 i 이하에서 가장 가까운 포즈
+  if (!poses) return null;
+  let lo = 0, hi = poseFrames.length - 1;
+  if (i < poseFrames[0]) return poses[0];
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (poseFrames[m] <= i) lo = m; else hi = m - 1; }
+  return poses[lo];
+}
+
+function buildFrame(npy) {
+  const s = +$("stride").value, zmax = +$("zmax").value;
+  const { fx, fy, ppx, ppy } = meta.intrinsics, sc = meta.depth_scale_m;
+  const useWorld = $("world").checked && poses;
+  const L = level ? level.R_level : [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const camH = level ? level.camera_height_m : 0.5;
+  const T = useWorld ? poseFor(cur).T : null;          // world <- camera (3x4)
+  const nMax = Math.ceil(npy.h / s) * Math.ceil(npy.w / s);
+  const pos = new Float32Array(nMax * 3), col = new Float32Array(nMax * 3);
+  let n = 0, near = Infinity;
+  for (let v = 0; v < npy.h; v += s) {
+    for (let u = 0; u < npy.w; u += s) {
+      const raw = npy.data[v * npy.w + u];
+      if (!raw) continue;
+      const z = raw * sc;
+      if (z < 0.2 || z > zmax) continue;
+      const x = (u - ppx) * z / fx, y = (v - ppy) * z / fy;
+      // 수평 맞춘 카메라 좌표 (높이 계산용)
+      const lx = L[0][0] * x + L[0][1] * y + L[0][2] * z;
+      const ly = L[1][0] * x + L[1][1] * y + L[1][2] * z;
+      const lz = L[2][0] * x + L[2][1] * y + L[2][2] * z;
+      const hgt = camH - ly;
+      if (Math.abs(lx) < 0.5 && hgt > 0.15 && hgt < 2 && lz < near) near = lz;
+      if (T) {
+        pos[n * 3] = T[0] * x + T[1] * y + T[2] * z + T[3];
+        pos[n * 3 + 1] = T[4] * x + T[5] * y + T[6] * z + T[7];
+        pos[n * 3 + 2] = T[8] * x + T[9] * y + T[10] * z + T[11];
+      } else { pos[n * 3] = lx; pos[n * 3 + 1] = ly; pos[n * 3 + 2] = lz; }
+      const [r, g, b] = turbo(hgt / H_MAX);
+      col[n * 3] = r; col[n * 3 + 1] = g; col[n * 3 + 2] = b;
+      n++;
+    }
+  }
+  frameGeom.setAttribute("position", new THREE.BufferAttribute(pos.subarray(0, n * 3), 3));
+  frameGeom.setAttribute("color", new THREE.BufferAttribute(col.subarray(0, n * 3), 3));
+  frameGeom.computeBoundingSphere();
+  // 카메라 마커 위치
+  if (T) {
+    camMarker.position.set(T[3], T[7], T[11]);
+    camMarker.setRotationFromMatrix(new THREE.Matrix4().set(T[0], T[1], T[2], 0, T[4], T[5], T[6], 0, T[8], T[9], T[10], 0, 0, 0, 0, 1));
+  } else { camMarker.position.set(0, 0, 0); camMarker.rotation.set(0, 0, 0); }
+  return { n, near };
+}
+
+let showing = -1, busy = false, pendingShow = null;
+async function show(i) {
+  if (busy) { pendingShow = i; return; }       // 처리 중이면 마지막 요청만 기억
+  busy = true;
+  try {
+    const npy = await fetchFrame(i);
+    const { n, near } = buildFrame(npy);
+    showing = i;
+    const t = (index[i].ts - index[0].ts) / 1000;
+    $("hud").innerHTML = `<b>${String(Math.floor(t / 60)).padStart(2, "0")}:${(t % 60).toFixed(2).padStart(5, "0")}</b>` +
+      ` &nbsp;frame ${i} / ${index.length - 1}<br>정면 장애물 ${isFinite(near) ? near.toFixed(2) + " m" : "-"} · 점 ${n.toLocaleString()}개`;
+    if ($("follow").checked) follow();
+    for (let k = 1; k <= 12; k++) if (i + k < index.length) fetchFrame(i + k);   // 미리 받기
+  } catch (e) { showMsg(`프레임 ${i} 읽기 실패: ${e.message}`); playing = false; $("play").textContent = "▶"; }
+  busy = false;
+  if (pendingShow !== null) { const p = pendingShow; pendingShow = null; if (p !== showing) show(p); }
+}
+
+// 카메라 따라가기: 깊이 카메라 뒤 4 m, 위 2.5 m
+const prevFollow = new THREE.Vector3();
+function follow() {
+  const target = new THREE.Vector3(), eye = new THREE.Vector3();
+  camMarker.updateMatrixWorld();
+  camMarker.localToWorld(target.set(0, 0, 5));
+  camMarker.localToWorld(eye.set(0, -2.5, -4));
+  // 사용자가 돌려 놓은 각도는 유지하면서 위치만 평행이동
+  const delta = eye.clone().sub(prevFollow);
+  if (prevFollow.lengthSq() === 0) { camera.position.copy(eye); controls.target.copy(target); }
+  else { camera.position.add(delta); controls.target.add(delta); }
+  prevFollow.copy(eye);
+}
+
+// ---- 누적 지도
+async function loadMap() {
+  if (mapPoints) return true;
+  showMsg("누적 지도 불러오는 중…");
+  try {
+    const geom = await new PLYLoader().loadAsync(`${MAP}/map_light.ply`);
+    mapPoints = new THREE.Points(geom, new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true }));
+    rs.add(mapPoints);
+    if (poses) {
+      const pts = poses.map((p) => new THREE.Vector3(p.T[3], p.T[7], p.T[11]));
+      trajLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xffffff }));
+      rs.add(trajLine);
+    }
+    showMsg("");
+    return true;
+  } catch (e) {
+    showMsg(`누적 지도를 못 읽었습니다 (${MAP}/map_light.ply).\nbuild_map.py 로 먼저 만들어야 합니다.\n${e.message}`);
+    return false;
+  }
+}
+
+function applyMode() {
+  $("mPlay").classList.toggle("on", mode === "play");
+  $("mMap").classList.toggle("on", mode === "map");
+  const mapVisible = mode === "map" || $("overlay").checked;
+  if (mapPoints) { mapPoints.visible = mapVisible; if (trajLine) trajLine.visible = mapVisible; }
+  framePts.visible = mode === "play";
+  camMarker.visible = mode === "play";
+  document.querySelectorAll(".playOnly").forEach((e) => (e.style.display = mode === "play" ? "contents" : "none"));
+  $("seek").style.visibility = mode === "play" ? "visible" : "hidden";
+  if (mode === "map" && mapPoints) {
+    mapPoints.geometry.computeBoundingBox();
+    const bb = mapPoints.geometry.boundingBox, c = new THREE.Vector3();
+    bb.getCenter(c); rs.localToWorld(c);
+    const size = bb.getSize(new THREE.Vector3()).length();
+    controls.target.copy(c); camera.position.set(c.x, c.y + size * 0.7, c.z + size * 0.4);
+    prevFollow.set(0, 0, 0);
+    $("hud").innerHTML = `누적 지도 · 복셀 ${mapPoints.geometry.attributes.position.count.toLocaleString()}개` +
+      (poses ? ` · 경로 ${poses.length.toLocaleString()} 포즈` : "") + "<br>마우스: 왼쪽 회전 · 휠 확대 · 오른쪽 이동";
+  }
+}
+
+// ---- UI
+$("mPlay").onclick = () => { mode = "play"; applyMode(); prevFollow.set(0, 0, 0); show(cur); };
+$("mMap").onclick = async () => { if (await loadMap()) { mode = "map"; playing = false; $("play").textContent = "▶"; applyMode(); } };
+$("play").onclick = () => { playing = !playing; $("play").textContent = playing ? "❚❚" : "▶"; lastT = performance.now(); accum = 0; };
+$("seek").oninput = () => { cur = +$("seek").value; show(cur); };
+["stride", "zmax"].forEach((id) => ($(id).onchange = () => show(cur)));
+$("world").onchange = async () => {
+  if ($("world").checked && !poses) { $("world").checked = false; showMsg("포즈(poses.csv)가 없어 월드 좌표를 쓸 수 없습니다."); return; }
+  prevFollow.set(0, 0, 0); show(cur);
+};
+$("overlay").onchange = async () => { if ($("overlay").checked && !(await loadMap())) $("overlay").checked = false; applyMode(); };
+$("follow").onchange = () => { prevFollow.set(0, 0, 0); if ($("follow").checked) follow(); };
+addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); $("play").click(); }
+  if (e.code === "ArrowRight") { cur = Math.min(index.length - 1, cur + (e.shiftKey ? 30 : 1)); $("seek").value = cur; show(cur); }
+  if (e.code === "ArrowLeft") { cur = Math.max(0, cur - (e.shiftKey ? 30 : 1)); $("seek").value = cur; show(cur); }
+});
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (playing && mode === "play") accum += (now - lastT) * +$("speed").value;   // 처리 중에도 시간은 흐름
+  if (playing && mode === "play" && !busy) {
+    // 로그의 실제 타임스탬프 기준으로 진행 (밀리면 프레임을 건너뜀)
+    const tNow = index[cur].ts + accum;
+    let nxt = cur;
+    while (nxt + 1 < index.length && index[nxt + 1].ts <= tNow) nxt++;
+    if (nxt !== cur) { accum = tNow - index[nxt].ts; cur = nxt; $("seek").value = cur; show(cur); }
+    if (cur >= index.length - 1) { playing = false; $("play").textContent = "▶"; }
+  }
+  lastT = now;
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// ---- 시작
+(async () => {
+  try {
+    meta = JSON.parse(await getText(`${LOG}/meta.json`));
+    index = parseCSV(await getText(`${LOG}/index.csv`)).map((r) => ({ file: r.file, ts: +r.timestamp_ms }));
+  } catch (e) {
+    showMsg(`로그를 못 읽었습니다: ${e.message}\n\ncode 폴더에서 서버를 띄우고 이 주소로 여세요:\n  python -m http.server 8000\n  http://localhost:8000/depth3d/viewer.html`);
+    return;
+  }
+  try { level = JSON.parse(await getText(`${MAP}/level.json`)); } catch { /* 없으면 기울기 보정 없이 */ }
+  try {
+    poses = parseCSV(await getText(`${MAP}/poses.csv`)).map((r) => ({
+      frame: +r.frame, T: ["T00","T01","T02","T03","T10","T11","T12","T13","T20","T21","T22","T23"].map((k) => +r[k]) }));
+    poseFrames = poses.map((p) => p.frame);
+  } catch { poses = null; $("world").disabled = true; $("world").parentElement.title = "poses.csv 없음 (build_map.py 실행 필요)"; }
+  $("seek").max = index.length - 1;
+  cur = +(qs.get("frame") || 0); $("seek").value = cur;
+  camera.position.set(0, 2.5, 4); controls.target.set(0, 0, -5);
+  requestAnimationFrame(loop);
+  show(cur);
+})();
+</script>
+</body>
+</html>
