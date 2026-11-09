@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# YOLO 가중치 (ultralytics가 자동 다운로드)
+*.pt
