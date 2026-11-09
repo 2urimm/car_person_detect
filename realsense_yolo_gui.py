@@ -8,14 +8,25 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QW
 import pyrealsense2 as rs
 from ultralytics import YOLO
 
-# COCO 클래스 ID: person=0, car=2
-TARGET_CLASSES = {0: "person", 2: "car"}
+# COCO 클래스 ID: person=0, bicycle=1, car=2, motorcycle=3, cat=15, dog=16
+TARGET_CLASSES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+                  15: "cat", 16: "dog"}
+
+# 클래스별 박스 색상 (BGR)
+CLASS_COLORS = {
+    0: (0, 255, 0),      # person: 초록
+    1: (255, 0, 255),    # bicycle: 보라
+    2: (255, 128, 0),    # car: 파랑
+    3: (0, 255, 255),    # motorcycle: 노랑
+    15: (203, 192, 255), # cat: 분홍
+    16: (0, 165, 255),   # dog: 주황
+}
 
 
 class CameraThread(QThread):
     change_pixmap_signal = Signal(np.ndarray)
     fps_signal = Signal(float)
-    count_signal = Signal(int, int)  # (person 개수, car 개수)
+    count_signal = Signal(dict)  # {클래스 ID: 개수}
 
     def __init__(self):
         super().__init__()
@@ -56,11 +67,11 @@ class CameraThread(QThread):
             # 이미지 변환
             color_image = np.asanyarray(color_frame.get_data())
 
-            # 3. YOLO 객체 탐지 (person, car만)
+            # 3. YOLO 객체 탐지 (person, car, 이륜차, 고양이·강아지만)
             results = model(color_image, stream=True, verbose=False,
                             classes=list(TARGET_CLASSES.keys()))
 
-            counts = {0: 0, 2: 0}
+            counts = {cls_id: 0 for cls_id in TARGET_CLASSES}
 
             for r in results:
                 for box in r.boxes:
@@ -75,8 +86,7 @@ class CameraThread(QThread):
                     cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
                     distance = depth_frame.get_distance(cx, cy)
 
-                    # person=초록, car=파랑 (BGR)
-                    color = (0, 255, 0) if cls == 0 else (255, 128, 0)
+                    color = CLASS_COLORS[cls]
                     cv2.rectangle(color_image, (x1, y1), (x2, y2), color, 2)
                     cv2.circle(color_image, (cx, cy), 5, (0, 0, 255), -1)
 
@@ -84,7 +94,7 @@ class CameraThread(QThread):
                     cv2.putText(color_image, text, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            self.count_signal.emit(counts[0], counts[2])
+            self.count_signal.emit(counts)
 
             # GUI 창으로 영상 프레임 전송
             self.change_pixmap_signal.emit(color_image)
@@ -113,8 +123,8 @@ class MainWindow(QMainWindow):
         self.info_label.setStyleSheet("font-size: 14px; font-weight: bold; margin-bottom: 5px;")
         self.layout.addWidget(self.info_label)
 
-        # person / car 개수 레이블
-        self.count_label = QLabel("Person: 0   |   Car: 0")
+        # 클래스별 개수 레이블
+        self.count_label = QLabel(self.format_counts({cls_id: 0 for cls_id in TARGET_CLASSES}))
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.count_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 5px;")
         self.layout.addWidget(self.count_label)
@@ -148,9 +158,18 @@ class MainWindow(QMainWindow):
         """실시간 프레임(FPS) 상단 정보 갱신"""
         self.info_label.setText(f"상태: 정상 작동 중 | 실시간 프레임: {fps:.1f} FPS")
 
-    def update_counts(self, person, car):
-        """person / car 검출 개수 갱신"""
-        self.count_label.setText(f"Person: {person}   |   Car: {car}")
+    @staticmethod
+    def format_counts(counts):
+        """클래스별 개수를 표시용 문자열로 변환 (이륜차 합계 포함)"""
+        two_wheeler = counts.get(1, 0) + counts.get(3, 0)
+        return (f"Person: {counts.get(0, 0)}   |   Car: {counts.get(2, 0)}   |   "
+                f"이륜차: {two_wheeler} (Motorcycle {counts.get(3, 0)} / "
+                f"Bicycle {counts.get(1, 0)})\n"
+                f"Dog: {counts.get(16, 0)}   |   Cat: {counts.get(15, 0)}")
+
+    def update_counts(self, counts):
+        """클래스별 검출 개수 갱신"""
+        self.count_label.setText(self.format_counts(counts))
 
     def closeEvent(self, event):
         """GUI 창이 닫힐 때 카메라 스레드 안전하게 종료"""
