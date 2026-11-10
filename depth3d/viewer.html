@@ -70,7 +70,7 @@ import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 //  ?log=../logs/<로그폴더>  ?map=../logs/depth3d_out/<지도폴더>  ?frame=<원본 프레임 번호>
 const qs = new URLSearchParams(location.search);
 const BASE_LOG = (qs.get("log") || "../logs/depth_20261016_195111").replace(/\/$/, "");
-const MAP = (qs.get("map") || "../logs/depth3d_out/full").replace(/\/$/, "");
+const MAP = (qs.get("map") || "../logs/depth3d_out/full_v2_loop").replace(/\/$/, "");
 const H_MAX = 3.0;
 const BASELINE = 0.05;                       // D435 기준선(m) — 면 연결 판단용 시차 계산
 

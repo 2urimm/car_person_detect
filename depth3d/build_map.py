@@ -247,8 +247,19 @@ def main():
         guess = T_rel_kf @ se3_exp(vel * dt)            # 등속 가정 초기값
         T_new, info = icp(src, kf, guess)
         degenerate = int(info["cond"] < 1e-3 or info["fitness"] < 0.3)
-        if degenerate:                                   # 정합 실패 -> 등속 예측 유지
-            T_new = guess
+        if degenerate:
+            # 등속 예측 자체가 틀려서(예: 직전 회전이 계속 이어짐) 정합이 실패했을 수 있음
+            # → '그 자리에 멈춰 있음'을 초기값으로 한 번 더 시도
+            T_s, info_s = icp(src, kf, T_rel_kf)
+            if not (info_s["cond"] < 1e-3 or info_s["fitness"] < 0.3):
+                T_new, info, degenerate = T_s, info_s, 0
+        if degenerate:
+            # 그래도 실패 -> 회전은 멈추고 이동만 서서히 감속하며 이어감
+            # (예전처럼 등속을 그대로 유지하면 몇 초 만에 수백 도씩 도는 가짜 회전이 쌓였음)
+            vel = vel.copy()
+            vel[:3] = 0
+            vel[3:] *= 0.9
+            T_new = T_rel_kf @ se3_exp(vel * dt)
         # 속도 갱신 (직전 상대 운동)
         step_T = np.linalg.inv(T_rel_kf) @ T_new
         rv = step_T[:3, :3]
